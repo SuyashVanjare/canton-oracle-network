@@ -1,0 +1,27 @@
+sdk-version: 3.1.0
+name: canton-oracle-network
+version: 0.1.0
+source: daml
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+parties:
+  - OracleService
+  - Publisher
+  - DataProviderA
+  - DataProviderB
+  - DataProviderC
+  - ConsumerA
+  - ConsumerB
+init-script: Main:setup
+build-options:
+  - --target=2.1
+exposed-modules:
+  - Oracle.V1.Asset
+  - Oracle.V1.Service
+  - Oracle.V1.Provider
+  - Oracle.V1.Publisher
+  - Oracle.V1.Report
+  - Oracle.V1.Consumer
+  - Oracle.V1.Dispute
