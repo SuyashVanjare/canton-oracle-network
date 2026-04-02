@@ -1,0 +1,239 @@
+module Oracle.Aggregator where
+
+import Daml.Script
+import DA.List (sort, length)
+import Oracle.PriceFeed (PriceData)
+import DA.Assert
+import DA.Optional (Optional(..), isSome)
+import DA.Time (Time, getTime)
+import DA.Math (divide)
+import DA.Set (fromList, member)
+import DA.Date (date, Month(..))
+
+-- | A request from a consumer to an aggregator for a median price of a specific asset.
+-- The aggregator will gather data from the specified list of providers.
+template PriceAggregationRequest
+  with
+    aggregator: Party
+      -- ^ The party responsible for aggregating the prices.
+    consumer: Party
+      -- ^ The party that will consume the final aggregated price.
+    asset: Text
+      -- ^ The identifier for the asset, e.g., "USD/CHF".
+    providers: [Party]
+      -- ^ The list of trusted data providers for this aggregation round.
+    minProviders: Int
+      -- ^ The minimum number of provider submissions required for a valid aggregation.
+    requestId: Text
+      -- ^ A unique identifier for this specific request.
+  where
+    signatory aggregator, consumer
+    observer providers
+
+    ensure minProviders > 0 && minProviders <= DA.List.length providers
+      && "Minimum providers must be positive and not exceed the total number of providers."
+
+    key (aggregator, consumer, requestId) : (Party, Party, Text)
+    maintainer key._1
+
+    -- | A provider submits their price data contract in response to the request.
+    -- This creates a `SubmittedPrice` contract linking the request to the data,
+    -- visible only to the provider and the aggregator, preserving privacy from the consumer.
+    nonconsuming choice SubmitPriceData : ContractId SubmittedPrice
+      with
+        provider: Party
+          -- ^ The party submitting the data, must be in the `providers` list.
+        priceDataCid: ContractId PriceData
+          -- ^ The contract containing the price data.
+      controller provider
+      do
+        assertMsg "Controller must be one of the designated providers." $
+          member provider (fromList providers)
+
+        priceData <- fetch priceDataCid
+        -- Validate that the submitted data matches the request parameters.
+        priceData.provider === provider
+        priceData.asset === asset
+
+        create SubmittedPrice with
+          requestCid = self
+          priceDataCid
+          provider
+          aggregator
+
+    -- | The aggregator collects all submitted prices, calculates the median,
+    -- and publishes the final result for the consumer.
+    choice Aggregate : ContractId AggregatedPrice
+      with
+        submittedPriceCids: [ContractId SubmittedPrice]
+          -- ^ A list of `SubmittedPrice` contract IDs provided for this round.
+      controller aggregator
+      do
+        -- Ensure we have enough submissions to meet the minimum requirement.
+        let numSubmissions = DA.List.length submittedPriceCids
+        assertMsg ("Insufficient number of price submissions. Required: " <> show minProviders <> ", Got: " <> show numSubmissions) $
+          numSubmissions >= minProviders
+
+        -- Fetch all submitted price data contracts in parallel.
+        (prices, contributingProviders) <- fmap unzip $ forA submittedPriceCids \cid -> do
+          submittedPrice <- fetch cid
+          -- Ensure the submission belongs to this specific aggregation request.
+          submittedPrice.requestCid === self
+          -- Ensure the provider is one of the authorized providers for this request.
+          assertMsg "Submission from an unauthorized provider." $
+            member submittedPrice.provider (fromList providers)
+
+          priceData <- fetch submittedPrice.priceDataCid
+          return (priceData.price, priceData.provider)
+
+        -- Calculate the median from the collected prices.
+        let medianPriceOpt = calculateMedian prices
+        let (Some medianPrice) = medianPriceOpt
+        assertMsg "Failed to calculate median. Price list might be empty." (isSome medianPriceOpt)
+
+        -- Get current time for the result timestamp.
+        now <- getTime
+
+        -- Create the final result contract for the consumer.
+        resultCid <- create AggregatedPrice with
+          aggregator
+          consumer
+          asset
+          medianPrice
+          contributingProviders
+          sourceRequestCid = self
+          timestamp = now
+
+        -- Clean up: archive this request and all associated submissions.
+        archive self
+        forA_ submittedPriceCids archive
+
+        return resultCid
+
+-- | A link contract created when a provider submits their price data.
+-- This contract is private between the provider and the aggregator.
+template SubmittedPrice
+  with
+    requestCid: ContractId PriceAggregationRequest
+      -- ^ The original request this submission is for.
+    priceDataCid: ContractId PriceData
+      -- ^ The actual price data contract.
+    provider: Party
+      -- ^ The provider who submitted the data.
+    aggregator: Party
+      -- ^ The aggregator who will process this data.
+  where
+    signatory provider
+    observer aggregator
+
+    key (aggregator, provider, requestCid) : (Party, Party, ContractId PriceAggregationRequest)
+    maintainer key._1
+
+
+-- | The final, published result of a price aggregation.
+-- This is the data point that the consumer receives.
+template AggregatedPrice
+  with
+    aggregator: Party
+      -- ^ The aggregator who produced this result.
+    consumer: Party
+      -- ^ The intended recipient of the price data.
+    asset: Text
+      -- ^ The asset identifier.
+    medianPrice: Decimal
+      -- ^ The calculated median price.
+    contributingProviders: [Party]
+      -- ^ The list of providers whose data was used in this calculation.
+    sourceRequestCid: ContractId PriceAggregationRequest
+      -- ^ A reference to the original request for auditability.
+    timestamp: Time
+      -- ^ The time at which the aggregation was performed.
+  where
+    signatory aggregator
+    observer consumer
+
+    key (aggregator, consumer, sourceRequestCid) : (Party, Party, ContractId PriceAggregationRequest)
+    maintainer key._1
+
+
+-- | Helper function to calculate the median of a list of Decimals.
+-- Returns `None` if the list is empty.
+calculateMedian : [Decimal] -> Optional Decimal
+calculateMedian prices =
+  let
+    sortedPrices = sort prices
+    n = length sortedPrices
+  in
+    if n == 0 then
+      None
+    else if n % 2 == 1 then
+      -- Odd number of elements: return the middle one.
+      -- `div` is integer division. E.g., for n=5, n/2=2, which is the 3rd element (index 2).
+      Some (sortedPrices !! (n `div` 2))
+    else
+      -- Even number of elements: return the average of the two middle ones.
+      let
+        mid1 = sortedPrices !! (n `div` 2 - 1)
+        mid2 = sortedPrices !! (n `div` 2)
+      in
+        Some ((mid1 + mid2) / 2.0)
+
+-- Example script to test the aggregation flow.
+test_aggregation : Script ()
+test_aggregation = script do
+  -- Parties
+  aggregator <- allocateParty "Aggregator"
+  consumer <- allocateParty "Consumer"
+  provider1 <- allocateParty "Provider1"
+  provider2 <- allocateParty "Provider2"
+  provider3 <- allocateParty "Provider3"
+
+  let providers = [provider1, provider2, provider3]
+  let asset = "EUR/USD"
+  let obs = [aggregator]
+  let dummyDate = date 2024 Jan 1
+
+  -- 1. Consumer and Aggregator create an aggregation request.
+  let requestId = "test-request-123"
+  requestCid <- submitMulti [aggregator, consumer] [] do
+    createCmd PriceAggregationRequest with
+      aggregator
+      consumer
+      asset
+      providers
+      minProviders = 3
+      requestId
+
+  -- 2. Providers create their price data and submit it.
+  priceDataCid1 <- submit provider1 do createCmd PriceData with provider = provider1, observers = obs, asset, price = 1.08, timestamp = dummyDate
+  submittedCid1 <- submit provider1 do exerciseCmd requestCid SubmitPriceData with provider = provider1, priceDataCid = priceDataCid1
+
+  priceDataCid2 <- submit provider2 do createCmd PriceData with provider = provider2, observers = obs, asset, price = 1.09, timestamp = dummyDate
+  submittedCid2 <- submit provider2 do exerciseCmd requestCid SubmitPriceData with provider = provider2, priceDataCid = priceDataCid2
+
+  -- Price from P3 is the median
+  priceDataCid3 <- submit provider3 do createCmd PriceData with provider = provider3, observers = obs, asset, price = 1.085, timestamp = dummyDate
+  submittedCid3 <- submit provider3 do exerciseCmd requestCid SubmitPriceData with provider = provider3, priceDataCid = priceDataCid3
+
+  let submittedPriceCids = [submittedCid1, submittedCid2, submittedCid3]
+
+  -- 3. Aggregator exercises the choice to aggregate the prices.
+  resultCid <- submit aggregator do
+    exerciseCmd requestCid Aggregate with submittedPriceCids
+
+  -- 4. Verify the result.
+  result <- fetch resultCid
+  let expectedMedian = 1.085
+  result.medianPrice === expectedMedian
+  assertMsg "Median price calculation is incorrect" $ result.medianPrice == expectedMedian
+  assertMsg "Incorrect number of contributing providers" $ (length result.contributingProviders) == 3
+
+  -- Verify cleanup: request contract should be archived.
+  (try (fetch requestCid)) === None
+  assertMsg "Original request contract was not archived." $ (try (fetch requestCid)) == None
+  -- Verify cleanup: submitted price contracts should be archived.
+  assertMsg "Submitted price contract 1 was not archived." $ (try (fetch submittedCid1)) == None
+  assertMsg "Submitted price contract 2 was not archived." $ (try (fetch submittedCid2)) == None
+  assertMsg "Submitted price contract 3 was not archived." $ (try (fetch submittedCid3)) == None
+
+  return ()
