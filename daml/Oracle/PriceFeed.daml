@@ -1,0 +1,80 @@
+-- | This module defines the core data structures and contracts for the Canton Oracle Network.
+-- It includes the definition for asset identifiers and the primary `PriceFeed` contract,
+-- which represents a single price observation from an authorized data provider.
+--
+-- The design is centered around creating immutable, signed attestations (the `PriceFeed`
+-- contracts) that can be aggregated by other on-chain processes.
+module Oracle.PriceFeed where
+
+import DA.Date
+import DA.Time
+import DA.Text
+import DA.Optional (Optional(..))
+import Oracle.Role (ProviderRole)
+
+-- | Represents a unique identifier for a financial asset.
+-- This allows the oracle to support various asset classes in a type-safe manner,
+-- preventing ambiguity in price requests and submissions.
+data AssetIdentifier =
+    -- | Foreign Exchange pair, e.g., base "EUR", quote "USD".
+    FXPair { base : Text, quote : Text }
+    -- | Government treasury bond, identified by CUSIP and maturity date.
+  | Treasury { cusip : Text, maturity : Date }
+    -- | Publicly traded equity, identified by its ticker and primary exchange, e.g., "AAPL" on "NASDAQ".
+  | Equity { ticker : Text, exchange : Text }
+    -- | Cryptocurrency pair, e.g., base "BTC", quote "USD".
+  | Crypto { base : Text, quote : Text }
+  deriving (Eq, Show, Ord)
+
+-- | Represents a single price point observation submitted by a data provider.
+--
+-- This contract is the fundamental building block of the oracle network. Each
+-- `PriceFeed` is a signed attestation from a provider about the price of a
+-- specific asset at a specific time. These contracts are then consumed by an
+-- aggregation contract to produce a canonical, trusted price for on-chain
+-- consumption by DeFi applications.
+template PriceFeed
+  with
+    provider          : Party
+      -- ^ The data provider party submitting the price feed.
+    publisher         : Party
+      -- ^ The oracle network operator party, responsible for aggregation and quality control.
+    assetId           : AssetIdentifier
+      -- ^ The unique identifier of the asset being priced.
+    price             : Decimal
+      -- ^ The observed price of the asset. It is recommended to use a high-precision decimal.
+    timestamp         : Time
+      -- ^ The UTC timestamp of when the price observation was made by the provider's system.
+    confidence        : Optional Decimal
+      -- ^ An optional confidence interval for the price, representing market volatility or
+      --   uncertainty in the observation. A smaller value indicates higher confidence.
+    providerRoleCid   : ContractId ProviderRole
+      -- ^ A reference to the provider's active `ProviderRole` contract. This is a critical
+      --   security measure, ensuring that only authorized and vetted providers can submit
+      --   price feeds to the network.
+  where
+    signatory provider
+    observer publisher
+
+    -- The key ensures that a provider can only have one active price feed for a
+    -- specific asset at a given microsecond-precision timestamp. This prevents
+    -- duplicate submissions and provides a stable, queryable identifier for each feed.
+    key (provider, assetId, timestamp) : (Party, AssetIdentifier, Time)
+    maintainer key._1
+
+    ensure
+      -- A price must always be positive. Zero or negative prices are considered invalid data.
+      price > 0.0 &&
+      -- If a confidence interval is provided, it must be non-negative.
+      case confidence of
+        Some c -> c >= 0.0
+        None   -> True
+
+    -- | Allows the provider to retract or clean up their submitted price feed.
+    -- This is useful for data correction or for lifecycle management of feeds
+    -- that are no longer relevant (e.g., after they have been aggregated).
+    choice Archive : ()
+      with
+      controller provider
+      do
+        pure ()
