@@ -1,0 +1,147 @@
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+
+module Oracle.ProviderRegistry where
+
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Time (Time)
+
+-- | Represents the different categories of financial data that an oracle can provide.
+data AssetClass
+  = FX             -- ^ Foreign Exchange Rates (e.g., EUR/USD)
+  | TreasuryYield  -- ^ Government Bond Yields (e.g., US 10-Year Treasury)
+  | Equity         -- ^ Stock Prices (e.g., AAPL)
+  | Crypto         -- ^ Cryptocurrency Prices (e.g., BTC/USD)
+  deriving (Eq, Ord, Show)
+
+-- | Represents the governing party responsible for managing the oracle network's provider registry.
+-- This party has the authority to onboard and offboard data providers.
+template RegistryOperator
+  with
+    operator : Party
+  where
+    signatory operator
+    key operator : Party
+    maintainer key
+
+    -- | Onboards a new data provider into the oracle network.
+    -- Creates an `ApprovedProvider` contract, signifying their official status.
+    choice OnboardProvider : ContractId ApprovedProvider
+      with
+        provider : Party
+        providerName : Text
+        approvedAssetClasses : Set AssetClass
+        initialStake : Decimal
+      controller operator
+      do
+        now <- getTime
+        create ApprovedProvider with
+          provider
+          operator
+          providerName
+          approvedAssetClasses
+          stakeAmount = initialStake
+          onboardedAt = now
+
+-- | Represents an officially recognized and staked data provider in the oracle network.
+-- This contract holds the provider's details, their stake, and the asset classes they are
+-- permitted to provide data for.
+template ApprovedProvider
+  with
+    provider : Party
+    operator : Party
+    providerName : Text
+    approvedAssetClasses : Set AssetClass
+    stakeAmount : Decimal
+    onboardedAt : Time
+  where
+    signatory provider, operator
+    observer provider
+
+    key (provider, operator) : (Party, Party)
+    maintainer key._1
+
+    ensure
+      stakeAmount >= 0.0 && not (Set.null approvedAssetClasses)
+
+    -- | Allows the provider to increase their staked amount.
+    choice AddStake : ContractId ApprovedProvider
+      with
+        amountToAdd : Decimal
+      controller provider
+      do
+        ensure amountToAdd > 0.0
+        create this with stakeAmount = stakeAmount + amountToAdd
+
+    -- | Allows the operator to update the set of asset classes the provider is approved for.
+    choice UpdateApprovedAssets : ContractId ApprovedProvider
+      with
+        newAssetClasses : Set AssetClass
+      controller operator
+      do
+        ensure not (Set.null newAssetClasses)
+        create this with approvedAssetClasses = newAssetClasses
+
+    -- | Allows a provider to initiate a request to reduce their stake.
+    -- This creates a `StakeReductionProposal` which the operator must approve.
+    choice RequestStakeReduction : ContractId StakeReductionProposal
+      with
+        reductionAmount : Decimal
+      controller provider
+      do
+        ensure reductionAmount > 0.0 && reductionAmount <= stakeAmount
+        create StakeReductionProposal with
+          approvedProviderCid = self
+          reductionAmount
+          provider
+          operator
+
+    -- | Allows the operator to forcibly remove a provider from the registry.
+    -- This is a powerful action, typically reserved for cases of malicious behavior or
+    -- violation of network rules. A precondition ensures that the provider's stake has
+    -- already been settled (e.g., returned or slashed) before removal.
+    choice RemoveProvider : ()
+      with
+        reason : Text
+      controller operator
+      do
+        -- In a real-world scenario, you might check that the stake is zero or that
+        -- a slashing/return process has completed.
+        assertMsg "Provider stake must be 0 before removal." (stakeAmount == 0.0)
+        pure ()
+
+-- | A proposal for a provider to reduce their staked collateral.
+-- This follows a standard proposal/acceptance pattern, requiring the operator's approval
+-- to prevent providers from irresponsibly unstaking after providing bad data.
+template StakeReductionProposal
+  with
+    approvedProviderCid : ContractId ApprovedProvider
+    reductionAmount : Decimal
+    provider : Party
+    operator : Party
+  where
+    signatory provider, operator
+
+    -- | The operator approves the stake reduction request.
+    -- This archives the old `ApprovedProvider` contract and creates a new one with the
+    -- reduced stake amount.
+    choice Accept : ContractId ApprovedProvider
+      controller operator
+      do
+        approvedProvider <- fetch approvedProviderCid
+        assert (approvedProvider.provider == provider)
+        assert (approvedProvider.operator == operator)
+
+        let newStakeAmount = approvedProvider.stakeAmount - reductionAmount
+        assertMsg "Reduction amount exceeds current stake." (newStakeAmount >= 0.0)
+
+        archive approvedProviderCid
+        create approvedProvider with stakeAmount = newStakeAmount
+
+    -- | The provider who made the request cancels it.
+    choice Cancel : ()
+      controller provider
+      do pure ()
