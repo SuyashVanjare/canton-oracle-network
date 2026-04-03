@@ -1,209 +1,111 @@
-# publisher/main.py
+#!/usr/bin/env python3
+"""Canton Oracle Network — Publisher SDK.
 
-# This script acts as a data publisher for the Canton Oracle Network.
-# It periodically fetches price data from an external source (e.g., Coinbase)
-# and submits it as an observation to an Aggregator contract on a Canton ledger
-# via the Canton Participant's JSON API.
+Fetches prices from external data sources and submits them to the Canton oracle
+contracts via the JSON Ledger API.
+"""
+from __future__ import annotations
 
-# --- Dependencies ---
-# To run this script, you need to install the required Python packages:
-# pip install requests python-dotenv
-
-import os
-import requests
-import time
+import argparse
+import asyncio
 import logging
-from datetime import datetime, timezone
-from decimal import Decimal
-from dotenv import load_dotenv
+import os
+import time
+from dataclasses import dataclass
+from typing import Optional
 
-# --- Configuration ---
+import httpx
 
-# Load environment variables from a .env file
-load_dotenv()
-
-# Configure logging for visibility into the script's operations
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("OraclePublisher")
-
-# Canton JSON API Configuration
-JSON_API_URL = os.getenv("CANTON_JSON_API_URL")
-AUTH_TOKEN = os.getenv("CANTON_AUTH_TOKEN") # This token must be a valid JWT for the participant
-PUBLISHER_PARTY_ID = os.getenv("PUBLISHER_PARTY_ID")
-
-# Publisher-specific Configuration
-# The asset this publisher instance is responsible for (e.g., "BTC/USD", "EUR/USD")
-ASSET_LABEL = os.getenv("ASSET_LABEL", "BTC/USD")
-# How often to fetch and submit data, in seconds
-SUBMISSION_INTERVAL_SECONDS = int(os.getenv("SUBMISSION_INTERVAL_SECONDS", "30"))
-
-# Daml Template IDs
-# These must match the template identifiers in your Daml project's DAR file.
-AGGREGATOR_TEMPLATE_ID = "Oracle.Aggregator:Aggregator"
+logger = logging.getLogger(__name__)
 
 
-# --- External Data Fetching ---
+@dataclass
+class PublisherConfig:
+    canton_host   : str   = "localhost"
+    canton_port   : int   = 7575
+    auth_token    : str   = ""
+    provider_party: str   = ""
+    authority_party: str  = ""
+    interval_secs : int   = 60
+    pairs         : list  = None
 
-def fetch_external_price(asset_label: str) -> Decimal | None:
-    """
-    Fetches the current price for a given asset from an external API.
-    This example uses the Coinbase API for BTC/USD.
-    It can be extended to support other assets or data sources.
-    """
-    if asset_label == "BTC/USD":
-        try:
-            url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
-            response = requests.get(url, timeout=5)
-            response.raise_for_status()  # Raises an HTTPError for bad responses (4xx or 5xx)
-            data = response.json()
-            price = Decimal(data['data']['amount'])
-            logger.info(f"Fetched {asset_label} price from Coinbase: {price}")
-            return price
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error fetching price from Coinbase API: {e}")
-            return None
-        except (KeyError, ValueError) as e:
-            logger.error(f"Error parsing price data from Coinbase response: {e}")
-            return None
-    else:
-        logger.warning(f"No data source configured for asset label: {asset_label}")
-        return None
+    def __post_init__(self):
+        if self.pairs is None:
+            self.pairs = ["EUR/USD", "GBP/USD", "BTC/USD"]
 
 
-# --- Canton Ledger Interaction via JSON API ---
-
-def get_json_api_headers() -> dict:
-    """Constructs the required headers for JSON API requests."""
-    return {
-        "Authorization": f"Bearer {AUTH_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
-def find_aggregator_contract(asset_label: str, party_id: str) -> dict | None:
-    """
-    Queries the ledger for an active Aggregator contract for the specified asset.
-    Returns the first matching contract found.
-    """
-    headers = get_json_api_headers()
-    query = {
-        "templateIds": [AGGREGATOR_TEMPLATE_ID],
-    }
-
-    logger.info(f"Querying for '{asset_label}' Aggregator contract...")
-    try:
-        response = requests.post(f"{JSON_API_URL}/v1/query", headers=headers, json=query, timeout=10)
-        response.raise_for_status()
-        contracts = response.json().get('result', [])
-
-        for contract in contracts:
-            # Filter the results to find the contract with the matching label
-            if contract.get('payload', {}).get('label') == asset_label:
-                logger.info(f"Found active Aggregator contract: {contract['contractId']}")
-                return contract
-
-        logger.warning(f"No active Aggregator contract found for label '{asset_label}'.")
-        return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to query for Aggregator contracts: {e}")
-        return None
-
-def submit_observation_to_ledger(contract_id: str, price: Decimal, party_id: str):
-    """
-    Exercises the 'SubmitObservation' choice on the specified Aggregator contract.
-    """
-    headers = get_json_api_headers()
-
-    # Timestamps in Daml are expected in ISO 8601 format with UTC timezone.
-    observation_time = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-    # The choice argument must match the Daml model's 'SubmitObservation' choice definition.
-    # Daml's 'Decimal' type is represented as a string in JSON.
-    choice_argument = {
-        "provider": party_id,
-        "observation": {
-            "value": str(price),
-            "timestamp": observation_time
+class OraclePublisher:
+    def __init__(self, config: PublisherConfig):
+        self.cfg = config
+        self.base_url = f"http://{config.canton_host}:{config.canton_port}"
+        self.headers = {
+            "Authorization": f"Bearer {config.auth_token}",
+            "Content-Type": "application/json",
         }
-    }
 
-    payload = {
-        "templateId": AGGREGATOR_TEMPLATE_ID,
-        "contractId": contract_id,
-        "choice": "SubmitObservation",
-        "argument": choice_argument
-    }
+    async def submit_price(self, client: httpx.AsyncClient, pair: str,
+                            price: float, source: str) -> None:
+        payload = {
+            "templateId": "Oracle:PriceFeed:PriceFeed",
+            "payload": {
+                "provider"  : self.cfg.provider_party,
+                "authority" : self.cfg.authority_party,
+                "pair"      : pair,
+                "price"     : str(price),
+                "timestamp" : time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "source"    : source,
+            },
+        }
+        resp = await client.post(f"{self.base_url}/v1/create", json=payload,
+                                  headers=self.headers, timeout=10.0)
+        resp.raise_for_status()
+        logger.info("Submitted %s = %.6f from %s", pair, price, source)
 
-    logger.info(f"Submitting observation to {contract_id}: Value={price}, Timestamp={observation_time}")
-    try:
-        response = requests.post(f"{JSON_API_URL}/v1/exercise", headers=headers, json=payload, timeout=10)
-        response.raise_for_status()
-        logger.info(f"Successfully exercised 'SubmitObservation' on contract {contract_id}")
-        return response.json().get('result')
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to exercise 'SubmitObservation' on {contract_id}: {e}")
-        # Log detailed error from the JSON API if available
-        try:
-            error_details = e.response.json()
-            logger.error(f"API Error details: {error_details}")
-        except (ValueError, AttributeError):
-            logger.error(f"Could not parse error details from API response.")
-        return None
+    async def run_once(self, client: httpx.AsyncClient) -> None:
+        from publisher.sources.forex    import fetch_forex_prices
+        from publisher.sources.treasury import fetch_treasury_yields
+
+        prices = await fetch_forex_prices(self.cfg.pairs)
+        for pair, (price, source) in prices.items():
+            await self.submit_price(client, pair, price, source)
+
+        yields = await fetch_treasury_yields()
+        for tenor, (yld, source) in yields.items():
+            await self.submit_price(client, f"UST/{tenor}", yld, source)
+
+    async def run(self) -> None:
+        async with httpx.AsyncClient() as client:
+            logger.info("Oracle publisher started. Interval: %ds", self.cfg.interval_secs)
+            while True:
+                try:
+                    await self.run_once(client)
+                except Exception as exc:
+                    logger.error("Publish cycle failed: %s", exc)
+                await asyncio.sleep(self.cfg.interval_secs)
 
 
-# --- Main Application Logic ---
+def main() -> None:
+    logging.basicConfig(level=logging.INFO,
+                         format="%(asctime)s %(levelname)s %(message)s")
+    parser = argparse.ArgumentParser(description="Canton Oracle Publisher")
+    parser.add_argument("--host",     default=os.getenv("CANTON_HOST", "localhost"))
+    parser.add_argument("--port",     type=int, default=int(os.getenv("CANTON_PORT", "7575")))
+    parser.add_argument("--token",    default=os.getenv("AUTH_TOKEN", ""))
+    parser.add_argument("--provider", default=os.getenv("PROVIDER_PARTY", ""))
+    parser.add_argument("--authority",default=os.getenv("AUTHORITY_PARTY", ""))
+    parser.add_argument("--interval", type=int, default=60)
+    args = parser.parse_args()
 
-def main_loop():
-    """Main execution loop for the publisher."""
-    while True:
-        # 1. Fetch the latest price from the external data source.
-        price = fetch_external_price(ASSET_LABEL)
-
-        if price is not None:
-            # 2. Find the target Aggregator contract on the Canton ledger.
-            # We look this up every time to handle contract churn (e.g., if the
-            # aggregator is upgraded or archived/recreated).
-            aggregator_contract = find_aggregator_contract(ASSET_LABEL, PUBLISHER_PARTY_ID)
-
-            if aggregator_contract:
-                # 3. If an aggregator is found, submit the observation.
-                submit_observation_to_ledger(
-                    contract_id=aggregator_contract['contractId'],
-                    price=price,
-                    party_id=PUBLISHER_PARTY_ID
-                )
-            else:
-                logger.warning("Skipping submission as no target contract was found.")
-        else:
-            logger.error("Failed to fetch external price data. Skipping submission cycle.")
-
-        # 4. Wait for the specified interval before the next cycle.
-        logger.info(f"Waiting for {SUBMISSION_INTERVAL_SECONDS} seconds...")
-        time.sleep(SUBMISSION_INTERVAL_SECONDS)
+    cfg = PublisherConfig(
+        canton_host    = args.host,
+        canton_port    = args.port,
+        auth_token     = args.token,
+        provider_party = args.provider,
+        authority_party= args.authority,
+        interval_secs  = args.interval,
+    )
+    asyncio.run(OraclePublisher(cfg).run())
 
 
 if __name__ == "__main__":
-    # Perform startup checks
-    if not all([JSON_API_URL, AUTH_TOKEN, PUBLISHER_PARTY_ID]):
-        logger.critical(
-            "CRITICAL: Missing required environment variables. "
-            "Please set CANTON_JSON_API_URL, CANTON_AUTH_TOKEN, and PUBLISHER_PARTY_ID."
-        )
-        exit(1)
-
-    logger.info("--- Oracle Publisher Service Starting ---")
-    logger.info(f"Publisher Party ID: {PUBLISHER_PARTY_ID}")
-    logger.info(f"Target Asset: {ASSET_LABEL}")
-    logger.info(f"JSON API Endpoint: {JSON_API_URL}")
-    logger.info(f"Submission Interval: {SUBMISSION_INTERVAL_SECONDS} seconds")
-    logger.info("---------------------------------------")
-
-    try:
-        main_loop()
-    except KeyboardInterrupt:
-        logger.info("Publisher service shutting down.")
-    except Exception as e:
-        logger.critical(f"An unhandled exception occurred: {e}", exc_info=True)
-        exit(1)
+    main()
