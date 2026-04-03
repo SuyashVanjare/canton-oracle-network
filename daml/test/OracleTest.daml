@@ -1,0 +1,209 @@
+module OracleTest where
+
+import Daml.Script
+import DA.Assert
+import DA.Date as Date
+import DA.Time as Time
+import DA.List (sort, head, length)
+import DA.Optional (isSome, fromSome)
+import Oracle.PriceFeed
+import Oracle.Aggregator
+import Oracle.ProviderRegistry
+
+-- === Test Setup ===
+
+-- A record to hold all the common parties and contract IDs for a test run.
+type Setup = {
+  aggregatorOp: Party,
+  publisher: Party,
+  consumer: Party,
+  provider1: Party,
+  provider2: Party,
+  provider3: Party,
+  provider4: Party,
+  registryCid: ContractId ProviderRegistry,
+  aggregatorCid: ContractId Aggregator,
+  now: Time
+}
+
+-- `setup` function to initialize the ledger state for each test.
+-- This pattern ensures tests are isolated from each other.
+setupTestLedger : Script Setup
+setupTestLedger = do
+  -- 1. Allocate all necessary parties for the tests.
+  aggregatorOp <- allocateParty "AggregatorOperator"
+  publisher <- allocateParty "Publisher"
+  consumer <- allocateParty "Consumer"
+  provider1 <- allocateParty "Provider1"
+  provider2 <- allocateParty "Provider2"
+  provider3 <- allocateParty "Provider3"
+  provider4 <- allocateParty "Provider4"
+
+  now <- getTime
+
+  -- 2. Create the central ProviderRegistry contract.
+  registryCid <- submit aggregatorOp do
+    create ProviderRegistry with operator = aggregatorOp, providers = []
+
+  -- 3. Register the provider parties with the registry.
+  let providers = [provider1, provider2, provider3, provider4]
+  forA_ providers \p ->
+    submit aggregatorOp do
+      exercise registryCid RegisterProvider with provider = p, providerName = show p
+
+  -- 4. Create the Aggregator contract that will be the subject of our tests.
+  aggregatorCid <- submit aggregatorOp do
+    create Aggregator with
+      operator = aggregatorOp
+      publisher
+      asset = "EUR/USD"
+      description = "Euro to US Dollar FX Rate"
+      minProviders = 3
+      maxStaleness = days 1
+      deviationThreshold = 2.5 -- A threshold for outlier detection (e.g., using MAD or stddev).
+      registryCid
+
+  return Setup with ..
+
+
+-- === Helper Functions ===
+
+-- Helper to submit and accept a list of price submissions.
+-- This reduces boilerplate in the test cases.
+submitAndAcceptPrices: Party -> [(Party, Decimal)] -> Time -> Script ()
+submitAndAcceptPrices operator submissions now = do
+  submissionCids <- forA submissions \(p, price) ->
+    submit p do
+      create PriceSubmission with
+        provider = p
+        asset = "EUR/USD"
+        price
+        observationTime = now
+        aggregatorOp = operator
+  forA_ submissionCids \subCid ->
+    submit operator do
+      exercise subCid AcceptSubmission
+  return ()
+
+
+-- === Test Cases ===
+
+-- Test 1: Happy path with multiple providers submitting valid, clustered prices.
+-- Verifies that the median is calculated correctly and all providers are included.
+multiProviderAggregationTest : Script ()
+multiProviderAggregationTest = do
+  Setup{..} <- setupTestLedger
+
+  let
+    submissions = [
+      (provider1, 1.0810),
+      (provider2, 1.0815),
+      (provider3, 1.0805)
+      ]
+
+  -- Action: Providers submit prices and the operator accepts them.
+  submitAndAcceptPrices aggregatorOp submissions now
+
+  -- Action: The publisher triggers the aggregation process.
+  (aggregatedCid, _aggPrice) <- submit publisher do
+    exercise aggregatorCid PublishAggregatedPrice with
+      publishTime = now
+
+  -- Verification
+  aggregatedPrice <- fetch aggregatedCid
+  let expectedPrice = 1.0810 -- Median of [1.0810, 1.0815, 1.0805]
+  let expectedProviders = [provider1, provider2, provider3]
+
+  -- Assert the aggregated price is the median of the inputs.
+  assertEquals aggregatedPrice.price expectedPrice
+    "Aggregated price did not match the expected median."
+
+  -- Assert the list of contributors is correct.
+  assertEquals (sort aggregatedPrice.contributors) (sort expectedProviders)
+    "List of contributing providers is incorrect."
+
+  -- Assert there were no outliers in this happy path scenario.
+  assertEquals aggregatedPrice.outliers []
+    "Outliers list should be empty for a valid price cluster."
+
+  -- Assert the asset identifier is correct.
+  assertEquals aggregatedPrice.asset "EUR/USD"
+    "Asset identifier is incorrect."
+
+
+-- Test 2: Aggregation with one clear outlier, which should be rejected.
+-- Verifies that the outlier is excluded from the final price and correctly reported.
+outlierRejectionTest : Script ()
+outlierRejectionTest = do
+  Setup{..} <- setupTestLedger
+
+  let
+    submissions = [
+      (provider1, 1.0810), -- Inlier
+      (provider2, 1.0815), -- Inlier
+      (provider3, 1.0805), -- Inlier
+      (provider4, 1.1500)  -- Outlier
+      ]
+
+  -- Action: Providers submit prices (including an outlier) and operator accepts.
+  submitAndAcceptPrices aggregatorOp submissions now
+
+  -- Action: Publisher triggers aggregation.
+  (aggregatedCid, _aggPrice) <- submit publisher do
+    exercise aggregatorCid PublishAggregatedPrice with
+      publishTime = now
+
+  -- Verification
+  aggregatedPrice <- fetch aggregatedCid
+  let expectedPrice = 1.0810 -- Median of the inliers [1.0810, 1.0815, 1.0805]
+  let expectedContributors = [provider1, provider2, provider3]
+  let expectedOutlierProvider = provider4
+
+  -- Assert the aggregated price is based only on the inliers.
+  assertEquals aggregatedPrice.price expectedPrice
+    "Aggregated price was not correctly calculated from inliers only."
+
+  -- Assert the list of contributors excludes the outlier.
+  assertEquals (sort aggregatedPrice.contributors) (sort expectedContributors)
+    "List of contributing providers should exclude the outlier."
+
+  -- Assert the outlier was correctly identified and reported.
+  assertEquals (length aggregatedPrice.outliers) 1
+    "Expected exactly one outlier to be reported."
+  let outlier = head aggregatedPrice.outliers
+  assertEquals outlier.provider expectedOutlierProvider
+    "Incorrect provider identified as outlier."
+  assertEquals outlier.price 1.1500
+    "Incorrect price for the outlier submission."
+
+
+-- Test 3: Aggregation fails if the minimum number of providers is not met.
+-- Verifies the business rule defined in the Aggregator contract.
+minProvidersNotMetTest : Script ()
+minProvidersNotMetTest = do
+  Setup{..} <- setupTestLedger
+
+  let
+    submissions = [
+      (provider1, 1.0810),
+      (provider2, 1.0815)
+      ] -- Only 2 submissions, but minProviders in setup is 3
+
+  -- Action: Submit and accept fewer prices than the minimum required.
+  submitAndAcceptPrices aggregatorOp submissions now
+
+  -- Action: Publisher attempts to trigger aggregation, which is expected to fail.
+  -- The `submitMustFail` block passes the test if the enclosed action fails as expected.
+  submitMustFail publisher do
+    exercise aggregatorCid PublishAggregatedPrice with
+      publishTime = now
+
+  return ()
+
+
+-- === Main Test Suite ===
+-- This is the entry point that `daml test` will run.
+oracleTests = script do
+  test "Happy Path: Correctly aggregates valid prices from multiple providers" multiProviderAggregationTest
+  test "Mechanism: Correctly identifies and rejects outlier price submissions" outlierRejectionTest
+  test "Failure Case: Fails to aggregate if minimum provider threshold is not met" minProvidersNotMetTest
