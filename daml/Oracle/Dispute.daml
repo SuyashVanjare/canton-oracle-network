@@ -1,0 +1,264 @@
+module Oracle.Dispute where
+
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Map (Map)
+import qualified DA.Map as Map
+import DA.Date (Month(..), date)
+import DA.Time (time, addRelTime, days)
+import Daml.Script
+import Oracle.PriceFeed (PriceObservation(..), AssetPair(..))
+import Oracle.Aggregator (AggregatedPrice(..))
+import Oracle.ProviderRegistry (ProviderRole(..))
+
+-- | Specifies the reason for initiating a dispute.
+data DisputeReason
+  = StalePrice
+  | DataManipulation
+  | TechnicalError
+  | Other
+  deriving (Eq, Show, Ord)
+
+-- | Represents a voter's decision in a dispute.
+data Vote
+  = UpholdDispute -- Vote agrees with the challenger.
+  | RejectDispute   -- Vote agrees with the provider.
+  deriving (Eq, Show, Ord)
+
+-- | The final outcome of a dispute resolution process.
+data DisputeOutcome
+  = Upheld    -- The challenge was successful; provider was at fault.
+  | Rejected  -- The challenge failed; provider's data was deemed valid.
+  | Expired   -- The dispute was not resolved by the deadline.
+  deriving (Eq, Show, Ord)
+
+-- | A contract representing an active dispute against a price observation.
+-- This contract manages the voting process among peer providers.
+template Dispute
+  with
+    disputeId: Text
+    challenger: Party
+    provider: Party
+    aggregator: Party
+    registry: Party
+    observationCid: ContractId PriceObservation
+    aggregatedPriceCid: ContractId AggregatedPrice
+    reason: DisputeReason
+    details: Text
+    initiatedAt: Time
+    votingDeadline: Time
+    voters: Set Party
+    votes: Map Party Vote
+  where
+    signatory aggregator, challenger
+
+    observer provider, (Set.toList voters)
+
+    ensure
+      initiatedAt < votingDeadline &&
+      Set.notMember provider voters &&
+      Set.notMember challenger voters
+
+    key (aggregator, disputeId) : (Party, Text)
+    maintainer key._1
+
+    -- | Allows an eligible voter to cast their vote on the dispute.
+    choice CastVote: ContractId Dispute
+      with
+        vote: Vote
+      controller voter: Party
+      do
+        now <- getTime
+        assertMsg "Voting has ended" (now <= votingDeadline)
+        assertMsg "Voter is not eligible to vote" (Set.member voter voters)
+        assertMsg "Voter has already cast a vote" (Map.notMember voter votes)
+
+        create this with
+          votes = Map.insert voter vote this.votes
+
+    -- | Allows the aggregator to resolve the dispute after the voting period has ended.
+    -- The outcome is determined by a simple majority. Ties result in rejection.
+    -- If the dispute is upheld, a penalty is applied to the provider's role contract.
+    choice ResolveDispute: ContractId ResolvedDispute
+      controller aggregator
+      do
+        now <- getTime
+        assertMsg "Cannot resolve dispute before voting deadline" (now > votingDeadline)
+
+        let
+          voteList = Map.values votes
+          upholdCount = length $ filter (== UpholdDispute) voteList
+          rejectCount = length voteList - upholdCount
+          (outcome, summary) =
+            if upholdCount > rejectCount then
+              (Upheld, "Dispute upheld. Votes: " <> show upholdCount <> " for, " <> show rejectCount <> " against.")
+            else
+              (Rejected, "Dispute rejected. Votes: " <> show upholdCount <> " for, " <> show rejectCount <> " against.")
+
+        -- If the dispute is upheld, fetch the provider's role and apply a penalty.
+        when (outcome == Upheld) do
+          (providerRoleCid, _providerRole) <- fetchByKey @ProviderRole (registry, provider)
+          exercise providerRoleCid ApplyPenalty with
+            reason = "Price feed dispute upheld: " <> details
+
+        create ResolvedDispute with
+          dispute = this
+          resolvedAt = now
+          outcome
+          resolutionSummary = summary
+
+-- | An archival contract that records the final outcome of a resolved dispute.
+template ResolvedDispute
+  with
+    dispute: Dispute
+    resolvedAt: Time
+    outcome: DisputeOutcome
+    resolutionSummary: Text
+  where
+    signatory dispute.aggregator
+    observer dispute.challenger, dispute.provider, (Set.toList dispute.voters)
+
+-- | Test script to demonstrate the dispute lifecycle.
+test_dispute_lifecycle : Script ()
+test_dispute_lifecycle = script do
+  -- Parties
+  aggregator <- allocateParty "Aggregator"
+  registry <- allocateParty "Registry"
+  challenger <- allocateParty "Challenger"
+  provider1 <- allocateParty "Provider1" -- The provider being challenged
+  provider2 <- allocateParty "Provider2" -- Voter
+  provider3 <- allocateParty "Provider3" -- Voter
+  provider4 <- allocateParty "Provider4" -- Voter
+
+  let allProviders = [provider1, provider2, provider3, provider4]
+  let voters = Set.fromList [provider2, provider3, provider4]
+
+  -- Time setup
+  startTime <- getTime
+  let votingDeadline = addRelTime startTime (days 2)
+
+  -- Create prerequisite contracts
+  provider1RoleCid <- submit registry do
+    create ProviderRole with
+      provider = provider1
+      registry
+      metadata = Map.fromList [("tier", "premium")]
+      reputationScore = 100.0
+
+  let assetPair = AssetPair "BTC" "USD"
+  observationCid <- submit provider1 do
+    create PriceObservation with
+      provider = provider1
+      assetPair
+      price = 60100.0
+      observationTime = startTime
+      observers = [aggregator]
+
+  aggregatedPriceCid <- submit aggregator do
+    create AggregatedPrice with
+      aggregator
+      assetPair
+      price = 60500.0
+      updateTime = startTime
+      contributingProviders = Set.fromList allProviders
+      sourceCids = [observationCid] -- Simplified for test
+      consumers = Set.empty
+
+  -- 1. Aggregator initiates a dispute on behalf of the challenger
+  let disputeId = "DISPUTE-001"
+  disputeCid <- submit aggregator do
+    createCmd Dispute with
+      disputeId
+      challenger
+      provider = provider1
+      aggregator
+      registry
+      observationCid
+      aggregatedPriceCid
+      reason = DataManipulation
+      details = "Submitted price is a significant outlier compared to peers."
+      initiatedAt = startTime
+      votingDeadline
+      voters
+      votes = Map.empty
+  
+  -- Must be submitted by both signatories
+  submit challenger do exerciseCmd disputeCid Archive
+
+  disputeCid2 <- submitMulti [aggregator, challenger] [] do
+    createCmd Dispute with
+      disputeId
+      challenger
+      provider = provider1
+      aggregator
+      registry
+      observationCid
+      aggregatedPriceCid
+      reason = DataManipulation
+      details = "Submitted price is a significant outlier compared to peers."
+      initiatedAt = startTime
+      votingDeadline
+      voters
+      votes = Map.empty
+
+  -- 2. Voters cast their votes
+  disputeVoted1Cid <- submit provider2 do
+    exercise disputeCid2 CastVote with vote = UpholdDispute
+
+  disputeVoted2Cid <- submit provider3 do
+    exercise disputeVoted1Cid CastVote with vote = UpholdDispute
+
+  disputeVoted3Cid <- submit provider4 do
+    exercise disputeVoted2Cid CastVote with vote = RejectDispute
+
+  -- 3. Time passes beyond the deadline
+  passTime (days 3)
+
+  -- 4. Aggregator resolves the dispute
+  resolvedCid <- submit aggregator do
+    exercise disputeVoted3Cid ResolveDispute
+
+  resolvedContract <- fetch resolvedCid
+  debug resolvedContract
+
+  -- Assertions
+  assert (resolvedContract.outcome == Upheld)
+  assert (resolvedContract.resolutionSummary == "Dispute upheld. Votes: 2 for, 1 against.")
+
+  -- Check that the provider's reputation was penalized
+  updatedProviderRole <- fetch provider1RoleCid
+  debug updatedProviderRole
+  assert (updatedProviderRole.reputationScore < 100.0)
+
+  -- Test rejection scenario
+  let disputeId2 = "DISPUTE-002"
+  dispute2Cid <- submitMulti [aggregator, challenger] [] do
+    createCmd Dispute with
+      disputeId = disputeId2
+      challenger
+      provider = provider1
+      aggregator
+      registry
+      observationCid
+      aggregatedPriceCid
+      reason = StalePrice
+      details = "Price was not updated during high volatility."
+      initiatedAt = startTime
+      votingDeadline
+      voters
+      votes = Map.empty
+
+  disputeVoted2_1Cid <- submit provider2 do
+    exercise dispute2Cid CastVote with vote = RejectDispute
+  disputeVoted2_2Cid <- submit provider3 do
+    exercise disputeVoted2_1Cid CastVote with vote = RejectDispute
+  disputeVoted2_3Cid <- submit provider4 do
+    exercise disputeVoted2_2Cid CastVote with vote = UpholdDispute
+
+  resolved2Cid <- submit aggregator do
+    exercise disputeVoted2_3Cid ResolveDispute
+
+  resolvedContract2 <- fetch resolved2Cid
+  debug resolvedContract2
+  assert (resolvedContract2.outcome == Rejected)
+  assert (resolvedContract2.resolutionSummary == "Dispute rejected. Votes: 1 for, 2 against.")
