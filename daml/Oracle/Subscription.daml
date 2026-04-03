@@ -1,0 +1,189 @@
+module Oracle.Subscription where
+
+import DA.Date
+import DA.Time
+import DA.Action
+import DA.Optional
+
+-- | Defines the different tiers of subscription available, which could affect
+-- | data resolution, update frequency, or cost.
+data SubscriptionTier = Basic | Premium | Enterprise
+  deriving (Eq, Show, Ord)
+
+-- | Represents a request from a consumer to subscribe to a specific price feed
+-- | managed by an aggregator. This is the first step in the subscription workflow.
+template SubscriptionRequest
+  with
+    consumer : Party
+      -- ^ The party requesting the subscription (e.g., a DeFi application).
+    aggregator : Party
+      -- ^ The aggregator managing the price feed.
+    asset : Text
+      -- ^ The asset identifier for the price feed (e.g., "BTC/USD").
+    tier : SubscriptionTier
+      -- ^ The requested subscription level.
+    requestedDurationDays : Int
+      -- ^ The duration of the subscription in days.
+    paymentReference : Text
+      -- ^ A reference for the off-ledger payment for the subscription.
+  where
+    signatory consumer
+    observer aggregator
+
+    choice AcceptSubscription : ContractId ActiveSubscription
+      -- ^ The aggregator accepts the subscription request, usually after verifying
+      -- | off-ledger payment.
+      with
+        acceptedAt : Time
+          -- ^ The timestamp of acceptance.
+      controller aggregator
+      do
+        -- Ensure the duration is positive
+        assertMsg "Subscription duration must be positive." (requestedDurationDays > 0)
+
+        let
+          startDate = date (year acceptedAt) (month acceptedAt) (day acceptedAt)
+          expiryDate = addDays startDate (fromInteger $ toInteger requestedDurationDays)
+
+        create ActiveSubscription with
+          consumer = consumer
+          aggregator = aggregator
+          asset = asset
+          tier = tier
+          startDate = startDate
+          expiryDate = expiryDate
+          lastRenewalDate = None
+
+    choice RejectSubscription : ()
+      -- ^ The aggregator rejects the subscription request.
+      with
+        reason : Text
+      controller aggregator
+      do
+        archive self
+
+    choice CancelRequest : ()
+      -- ^ The consumer withdraws their subscription request.
+      controller consumer
+      do
+        archive self
+
+-- | Represents an active, paid subscription to a price feed. The existence of
+-- | this contract serves as proof of authorization for the consumer to observe
+-- | the corresponding price data.
+template ActiveSubscription
+  with
+    consumer : Party
+      -- ^ The party subscribed to the feed.
+    aggregator : Party
+      -- ^ The aggregator providing the feed.
+    asset : Text
+      -- ^ The asset identifier for the price feed.
+    tier : SubscriptionTier
+      -- ^ The subscription level.
+    startDate : Date
+      -- ^ The date the subscription became active.
+    expiryDate : Date
+      -- ^ The date the subscription will expire.
+    lastRenewalDate: Optional Date
+      -- ^ The start date of the most recent renewal period, if applicable.
+  where
+    signatory consumer, aggregator
+
+    key (consumer, aggregator, asset) : (Party, Party, Text)
+    maintainer key._1, key._2
+
+    choice RequestRenewal : ContractId SubscriptionRenewalRequest
+      -- ^ The consumer requests to renew their subscription before it expires.
+      with
+        renewalDurationDays : Int
+          -- ^ The requested duration for the renewal period.
+        renewalPaymentReference : Text
+          -- ^ A new payment reference for the renewal fee.
+      controller consumer
+      do
+        now <- getTime
+        let today = date (year now) (month now) (day now)
+        assertMsg "Cannot request renewal for an expired subscription." (expiryDate >= today)
+        assertMsg "Renewal duration must be positive." (renewalDurationDays > 0)
+
+        create SubscriptionRenewalRequest with
+          consumer = consumer
+          aggregator = aggregator
+          asset = asset
+          renewalDurationDays = renewalDurationDays
+          existingSubCid = self
+          paymentReference = renewalPaymentReference
+
+    choice Terminate : ()
+      -- ^ The consumer or aggregator can terminate the subscription.
+      -- | This is an immediate cancellation.
+      with
+        terminator : Party
+          -- ^ The party initiating the termination.
+        reason : Text
+          -- ^ The reason for termination.
+      controller terminator
+      do
+        assertMsg "Terminator must be either the consumer or the aggregator."
+          (terminator == consumer || terminator == aggregator)
+        archive self
+
+-- | A proposal from a consumer to renew an existing `ActiveSubscription`.
+template SubscriptionRenewalRequest
+  with
+    consumer : Party
+      -- ^ The party requesting the renewal.
+    aggregator : Party
+      -- ^ The aggregator managing the feed.
+    asset : Text
+      -- ^ The asset being renewed.
+    renewalDurationDays : Int
+      -- ^ The duration of the renewal in days.
+    existingSubCid : ContractId ActiveSubscription
+      -- ^ The contract ID of the subscription to be renewed.
+    paymentReference : Text
+      -- ^ The payment reference for this renewal.
+  where
+    signatory consumer
+    observer aggregator
+
+    choice AcceptRenewal : ContractId ActiveSubscription
+      -- ^ The aggregator accepts the renewal request.
+      controller aggregator
+      do
+        -- Fetch the existing subscription to get its expiry date.
+        existingSub <- fetch existingSubCid
+
+        -- The new subscription starts from the expiry date of the old one.
+        let
+          newStartDate = existingSub.expiryDate
+          newExpiryDate = addDays newStartDate (fromInteger $ toInteger renewalDurationDays)
+
+        -- Archive the renewal request and the old subscription.
+        archive self
+        archive existingSubCid
+
+        -- Create the new, renewed subscription.
+        create ActiveSubscription with
+          consumer = existingSub.consumer
+          aggregator = existingSub.aggregator
+          asset = existingSub.asset
+          tier = existingSub.tier
+          startDate = existingSub.startDate -- Original start date is preserved.
+          expiryDate = newExpiryDate
+          lastRenewalDate = Some newStartDate
+
+    choice RejectRenewal : ()
+      -- ^ The aggregator rejects the renewal request.
+      with
+        reason : Text
+      controller aggregator
+      do
+        archive self
+
+    choice CancelRenewalRequest : ()
+      -- ^ The consumer withdraws their renewal request.
+      controller consumer
+      do
+        archive self
