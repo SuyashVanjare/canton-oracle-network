@@ -1,0 +1,245 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Oracle.Slashing where
+
+import Daml.Script
+import DA.Time (Time, addRelTime, relTime)
+import DA.Assert ((assert, assertMsg))
+import DA.Date (days, seconds)
+import DA.Any (toAnyContractId)
+
+-- These imports reference contracts defined in other modules of the oracle network.
+-- Their existence is assumed for the logic within this module to be complete.
+import qualified Oracle.Provider as Provider
+import qualified Oracle.Dispute as Dispute
+
+-- | A record of a successfully executed slash event for auditing and reputation tracking.
+template SlashingRecord
+  with
+    operator: Party
+      -- ^ The party that initiated the slash (typically the oracle network operator or publisher).
+    provider: Party
+      -- ^ The data provider whose stake was slashed.
+    slashedAmount: Decimal
+      -- ^ The amount deducted from the provider's stake.
+    reason: Text
+      -- ^ A human-readable reason for the slash.
+    evidence: SlashingEvidence
+      -- ^ The structured data that triggered the slashing event.
+    timestamp: Time
+      -- ^ The UTC time when the slash was executed.
+  where
+    signatory operator, provider
+
+-- | Structured evidence used to justify a slashing proposal.
+-- This provides a clear, auditable reason for penalizing a provider.
+data SlashingEvidence = SlashingEvidence with
+  assetId: Text
+    -- ^ The identifier of the asset for which the data was submitted (e.g., "EUR/USD").
+  providerValue: Decimal
+    -- ^ The outlier value submitted by the provider.
+  aggregateValue: Decimal
+    -- ^ The aggregated (e.g., median) value from all providers for the same observation.
+  observationTime: Time
+    -- ^ The timestamp of the specific data observation.
+  deriving (Eq, Show)
+
+-- | A proposal to slash a data provider's stake due to the submission of outlier data.
+-- This contract initiates the penalty process, giving the provider an opportunity to
+-- accept the penalty or open a formal dispute.
+template SlashingProposal
+  with
+    operator: Party
+      -- ^ The party proposing the slash (e.g., the oracle network operator).
+    provider: Party
+      -- ^ The provider accused of submitting outlier data.
+    stakeCid: ContractId Provider.Stake
+      -- ^ The contract ID of the provider's stake, which is the target of the slash.
+    slashingPenalty: Decimal
+      -- ^ The amount to be slashed from the provider's stake.
+    evidence: SlashingEvidence
+      -- ^ Structured data demonstrating the provider's submission was an outlier.
+    deadline: Time
+      -- ^ The time by which the provider must respond (accept or dispute).
+  where
+    signatory operator
+    observer provider
+
+    key (operator, provider, evidence.assetId, evidence.observationTime) : (Party, Party, Text, Time)
+    maintainer key._1
+
+    ensure slashingPenalty > 0.0
+
+    -- | Choice for the provider to acknowledge the outlier and accept the penalty.
+    -- This results in the immediate slashing of their stake and the creation of a
+    -- historical record.
+    choice AcknowledgeAndAcceptSlash : ContractId SlashingRecord
+      controller provider
+      do
+        -- Fetch the stake contract to ensure it's still valid and matches the parties.
+        stake <- fetch stakeCid
+        assert (stake.provider == provider && stake.operator == operator)
+
+        -- Exercise the choice on the stake contract to deduct the penalty.
+        exercise stakeCid Provider.Slash with slashAmount = slashingPenalty
+
+        -- Create an immutable record of the completed slash event.
+        t <- getTime
+        create SlashingRecord with
+          reason = "Provider acknowledged and accepted the slash."
+          slashedAmount = slashingPenalty
+          timestamp = t
+          ..
+
+    -- | Choice for the provider to formally dispute the slashing proposal.
+    -- This archives the proposal and initiates a new workflow by creating a `DisputeRequest`.
+    choice DisputeSlash : ContractId Dispute.DisputeRequest
+      controller provider
+      do
+        -- Create a dispute request contract, which will be handled by a separate dispute resolution process.
+        t <- getTime
+        create Dispute.DisputeRequest with
+          claimant = provider
+          defendant = operator
+          details = "Disputing slashing proposal for asset " <> evidence.assetId <>
+                    ". Provider value: " <> show evidence.providerValue <>
+                    ", Aggregate value: " <> show evidence.aggregateValue <> "."
+          relatedCid = Some (toAnyContractId stakeCid)
+          creationTime = t
+
+    -- | Choice for the operator to enforce the slash if the provider fails to respond by the deadline.
+    -- This ensures that providers cannot avoid penalties by simply ignoring proposals.
+    choice ExpireAndSlash : ContractId SlashingRecord
+      controller operator
+      do
+        t <- getTime
+        assertMsg "Deadline has not yet passed. Cannot expire proposal." (t > deadline)
+
+        -- Similar logic to AcknowledgeAndAcceptSlash, executed by the operator post-deadline.
+        stake <- fetch stakeCid
+        assert (stake.provider == provider && stake.operator == operator)
+
+        exercise stakeCid Provider.Slash with slashAmount = slashingPenalty
+
+        create SlashingRecord with
+          reason = "Provider failed to respond before the deadline."
+          slashedAmount = slashingPenalty
+          timestamp = t
+          ..
+
+    -- | Choice for the operator to withdraw the proposal, for instance, if it was created in error.
+    choice WithdrawProposal : ()
+      controller operator
+      do
+        pure () -- Consumes the proposal contract without further action.
+
+-- === Test Setup ===
+-- The following script provides a self-contained test suite for this module.
+-- It uses local dummy templates to stand in for external dependencies like
+-- `Provider.Stake` and `Dispute.DisputeRequest` for isolated unit testing.
+
+-- | A simplified, local definition of the Stake template for testing.
+template DummyStake
+  with
+    provider: Party
+    operator: Party
+    amount: Decimal
+  where
+    signatory provider, operator
+    observer provider, operator
+
+    choice Slash: ContractId DummyStake
+      with slashAmount: Decimal
+      controller operator
+      do
+        assert (slashAmount > 0.0 && slashAmount <= amount)
+        create this with amount = amount - slashAmount
+
+-- | A simplified, local definition of the DisputeRequest template for testing.
+template DummyDisputeRequest
+  with
+    claimant: Party
+    defendant: Party
+    details: Text
+  where
+    signatory claimant, defendant
+
+setupSlashingTest : Script (Party, Party, ContractId Provider.Stake)
+setupSlashingTest = script do
+  operator <- allocatePartyWithHint "Operator" (PartyIdHint "operator")
+  provider <- allocatePartyWithHint "Provider" (PartyIdHint "provider")
+
+  -- Create a dummy Stake contract for testing purposes.
+  -- In a real scenario, this would be created as part of the provider onboarding process.
+  stakeCid <- submit operator do
+    createCmd DummyStake with provider, operator, amount = 1000.0
+
+  -- The `coerceContractId` is necessary because we are using a local `DummyStake`
+  -- template, but the `SlashingProposal` expects a `ContractId Provider.Stake`.
+  -- This works in scripts for testing but highlights the dependency.
+  return (operator, provider, coerceContractId stakeCid)
+
+slashingProposalTest: Script ()
+slashingProposalTest = script do
+  (operator, provider, stakeCid) <- setupSlashingTest
+
+  now <- getTime
+  let
+    deadline = addRelTime now (days 2)
+    testEvidence = SlashingEvidence with
+      assetId = "EUR/USD"
+      providerValue = 1.0800
+      aggregateValue = 1.0900
+      observationTime = now
+
+  -- Test 1: Provider acknowledges and accepts the slash
+  test "Provider accepts slash" do
+    proposalCid <- submit operator do
+      createCmd SlashingProposal with
+        operator, provider, stakeCid, deadline
+        slashingPenalty = 100.0
+        evidence = testEvidence
+    recordCid <- submit provider do exerciseCmd proposalCid AcknowledgeAndAcceptSlash
+    record <- fetch recordCid
+    record.provider === provider
+    record.slashedAmount === 100.0
+
+  -- Test 2: Provider disputes the slash
+  test "Provider disputes slash" do
+    proposalCid <- submit operator do
+      createCmd SlashingProposal with
+        operator, provider, stakeCid, deadline
+        slashingPenalty = 50.0
+        evidence = testEvidence with observationTime = addRelTime now (seconds 1) -- unique key
+    disputeCid <- submit provider do exerciseCmd proposalCid DisputeSlash
+    dispute <- fetch (coerceContractId disputeCid : ContractId DummyDisputeRequest)
+    dispute.claimant === provider
+    dispute.defendant === operator
+
+  -- Test 3: Proposal expires and operator slashes
+  test "Operator slashes after expiry" do
+    let expiryDeadline = now -- Set deadline to now to allow immediate expiration
+    proposalCid <- submit operator do
+      createCmd SlashingProposal with
+        operator, provider, stakeCid
+        deadline = expiryDeadline
+        slashingPenalty = 75.0
+        evidence = testEvidence with observationTime = addRelTime now (seconds 2) -- unique key
+    pass (relTime 1 0) -- Pass time to ensure deadline is passed
+    recordCid <- submit operator do exerciseCmd proposalCid ExpireAndSlash
+    record <- fetch recordCid
+    record.provider === provider
+    record.slashedAmount === 75.0
+
+  -- Test 4: Operator withdraws the proposal
+  test "Operator withdraws proposal" do
+    proposalCid <- submit operator do
+      createCmd SlashingProposal with
+        operator, provider, stakeCid, deadline
+        slashingPenalty = 25.0
+        evidence = testEvidence with observationTime = addRelTime now (seconds 3) -- unique key
+    submit operator do exerciseCmd proposalCid WithdrawProposal
+    -- Assert that the proposal is no longer active
+    query @SlashingProposal provider >>= \proposals ->
+      assert (not $ any (\c -> c._1 == proposalCid) proposals)
